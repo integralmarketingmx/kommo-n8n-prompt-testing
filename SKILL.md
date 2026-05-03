@@ -5,6 +5,79 @@ description: Use when testing an n8n AI agent that receives Kommo CRM webhooks a
 
 # Kommo + n8n Prompt Testing
 
+## Requirements
+
+Everything that must exist before activating this skill or requesting tests.
+
+### n8n Side
+
+| Requisito | Detalle |
+|-----------|---------|
+| Workflow publicado | El workflow debe estar en estado **Active** y con el webhook en modo Production |
+| Webhook URL accesible | `https://<host>/webhook/<path>` — debe responder 200 a un POST vacío |
+| Nodo `Postgres Chat Memory` | Credencial PostgreSQL adjunta y conexión probada (`Connection tested successfully`) |
+| Nodo `Get a document` | Credencial Google Docs adjunta; el Doc debe ser accesible por la cuenta |
+| Credenciales OAuth Kommo | Nodo `Credenciales_Kommo` y todos los httpRequest que usan `oAuth2Api` con credencial activa |
+| `If_Pipeline correcto` | El filtro debe incluir la etapa del lead de prueba (por defecto `102560443` IA Atendiendo; agregar `102627227` CONTACTO_INICIAL si se usa `/reset`) |
+| LLM configurado | Nodo de AI Agent con modelo válido (Gemini, GPT, Claude) y credencial activa |
+| Backup del workflow exportado | Archivo `.json` del workflow exportado desde n8n UI — necesario para restaurar credenciales después de cada PUT por API |
+
+### Kommo CRM Side
+
+| Requisito | Detalle |
+|-----------|---------|
+| Lead de prueba dedicado | Un lead real en el pipeline correcto; se usa para tests sin afectar leads de producción |
+| `entity_id` del lead | ID numérico del lead (ej. `58392030`) — va como `session_id` en Supabase y como `entity_id` en el webhook |
+| `contact_id` del lead | ID del contacto asociado al lead (ej. `99455352`) |
+| Token de larga duración | JWT Kommo con scope `crm` + `files` + `notifications`, expira ~2030. Obtener en: Kommo → Configuración → Integraciones → token |
+| Etapas del pipeline mapeadas | Conocer los `status_id` de las etapas: IA Atendiendo, Taquilla, Atención Manual, r2-3dias, etc. |
+| Bot de salesbot activo | `bot_id` del salesbot que envía mensajes al cliente; debe estar publicado |
+| Campo `Detener IA` limpio | Campo `field_id: 3161418` del lead de prueba debe estar vacío/false; si está activo, el workflow para antes del agente |
+
+### Supabase Side
+
+| Requisito | Detalle |
+|-----------|---------|
+| Tabla `n8n_chat_histories` | Debe existir con columnas: `id` (serial), `session_id` (text), `message` (jsonb o text) |
+| Anon key con acceso a la tabla | RLS desactivado para la tabla o política que permita SELECT/DELETE con anon key |
+| URL del proyecto | `https://<project_ref>.supabase.co` |
+
+### Credenciales del Agente (Claude Code)
+
+Archivo `.claude/secrets/<proyecto>.env` debe contener:
+
+```bash
+KOMMO_LONG_LIVED_TOKEN=eyJ...
+KOMMO_DOMAIN=https://<subdomain>.kommo.com
+SUPABASE_URL=https://<ref>.supabase.co
+SUPABASE_ANON_KEY=eyJ...
+N8N_WEBHOOK_URL=https://<host>/webhook/<path>
+N8N_API_TOKEN_90D=eyJ...           # Para PUTs al workflow vía API
+TEST_LEAD_ID=<entity_id>
+TEST_CONTACT_ID=<contact_id>
+TEST_CHAT_ID=test_chat_<lead_id>   # Puede ser cualquier string único
+```
+
+### Checklist de verificación rápida
+
+Antes de activar el skill o pedir pruebas, confirmar:
+
+```
+[ ] Workflow en n8n está Active
+[ ] Postgres Chat Memory tiene credencial adjunta y testeada
+[ ] Lead de prueba existe en Kommo en el pipeline correcto
+[ ] Tengo el entity_id y contact_id del lead de prueba
+[ ] Tengo el token de larga duración de Kommo
+[ ] Tengo la anon key de Supabase
+[ ] La tabla n8n_chat_histories existe y permite SELECT/DELETE
+[ ] Tengo el backup exportado del workflow (.json) para restaurar credenciales
+[ ] El bot de salesbot está publicado y activo
+```
+
+Si algún ítem falta, el agente de Claude puede ayudar a obtenerlo — pero necesita saber cuáles credenciales ya están disponibles.
+
+---
+
 ## Overview
 
 Technique for end-to-end testing of n8n AI agents integrated with Kommo CRM. The agent receives webhook messages, processes them with an LLM, updates Kommo lead fields, and stores conversation history in Supabase. Tests simulate real WhatsApp conversations by sending webhook payloads and polling Supabase for AI responses.
