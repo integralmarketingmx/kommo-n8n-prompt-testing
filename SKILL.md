@@ -284,35 +284,141 @@ If n8n execution completes in < 2 seconds with no Supabase output:
 
 4. **Webhook path incorrecto** — Check the URL path matches the published webhook in n8n.
 
-## n8n Workflow Update Safety
+## Backup Before Every Workflow Change
 
-**CRITICAL:** Updating the workflow via PUT API clears all OAuth credential references from nodes that have `credentials: {}` in the API response. The GET endpoint omits credentials for security — the stored object differs from what is returned.
+**Run this before touching the workflow — via API or UI.** The n8n export from the UI is the only source that includes real credential IDs.
 
-**Safe update procedure:**
+```bash
+# Descargar workflow completo con credenciales desde n8n UI export
+# (En n8n: Editor → ··· → Download — NO desde la API, que omite credentials)
+# Guardar en: n8n-<proyecto>/Respaldos n8n/<nombre>(fecha).json
+
+# Si usas la API para leer el estado actual (credentials vendrán vacías):
+N8N_API_TOKEN="eyJ..."
+WORKFLOW_ID="OhOYFy2Za4hjppbv"
+curl -s \
+  -H "X-N8N-API-KEY: $N8N_API_TOKEN" \
+  "https://<host>/api/v1/workflows/$WORKFLOW_ID" \
+  > /tmp/workflow_current.json
+# ⚠️ Este archivo tendrá credentials:{} — NO sirve como backup de credenciales
+```
+
+**Estructura de carpeta de respaldos:**
+```
+n8n-<proyecto>/
+  Respaldos n8n/
+    <NombreWorkflow>(Apr 30 at 18_00_00).json   ← exportado desde UI
+    <NombreWorkflow>(May 2 at 20_04_20).json
+    <NombreWorkflow>(May 3 at 09_15_00).json     ← siempre el más reciente
+```
+
+Nombrar con fecha y hora del export. El archivo más reciente es el backup activo.
+
+## n8n Workflow Update Safety — PATCH por nodo, no PUT completo
+
+**Regla de oro:** el endpoint `PUT /api/v1/workflows/{id}` reemplaza el workflow completo. Si el payload tiene `credentials: {}` en algún nodo (que es lo que devuelve el GET de la API), n8n borra esa credencial del nodo en la base de datos. **Esto rompe todos los nodos OAuth en producción.**
+
+### Opción A — PATCH selectivo (preferida)
+
+Modifica solo el campo específico del nodo sin tocar el resto del workflow:
+
+```python
+import json, subprocess, re
+
+def patch_node_field(workflow_json_path, node_name, param_path, new_value,
+                     api_token, host, workflow_id):
+    """
+    Carga el workflow del backup (con credentials reales),
+    modifica SOLO el campo indicado en el nodo, y hace PUT preservando todo.
+    
+    param_path: lista de keys para navegar en parameters, ej. ['jsonBody']
+                o ['conditions', 'conditions', 0, 'leftValue']
+    """
+    with open(workflow_json_path) as f:
+        wf = json.load(f)
+
+    # Modificar solo el nodo objetivo
+    modified = False
+    for node in wf.get('nodes', []):
+        if node['name'] == node_name:
+            target = node['parameters']
+            for key in param_path[:-1]:
+                target = target[key] if isinstance(key, str) else target[key]
+            target[param_path[-1]] = new_value
+            modified = True
+            break
+
+    if not modified:
+        raise ValueError(f"Nodo '{node_name}' no encontrado")
+
+    # PUT con credentials del backup (nunca del GET de la API)
+    payload = {
+        "name": wf["name"],
+        "nodes": wf["nodes"],           # incluye credentials reales
+        "connections": wf["connections"],
+        "settings": wf.get("settings", {}),
+        "staticData": wf.get("staticData"),
+    }
+
+    with open('/tmp/wf_patch.json', 'w') as f:
+        json.dump(payload, f)
+
+    r = subprocess.run([
+        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+        "-X", "PUT",
+        "-H", f"X-N8N-API-KEY: {api_token}",
+        "-H", "Content-Type: application/json",
+        "-d", f"@/tmp/wf_patch.json",
+        f"https://{host}/api/v1/workflows/{workflow_id}"
+    ], capture_output=True, text=True)
+
+    return r.stdout.strip()  # "200" si OK
+```
+
+### Opción B — PUT con restauración de credenciales (cuando no hay backup reciente)
 
 ```python
 import json
 
-# 1. Load the latest exported backup (contains real credential IDs)
-with open('backup.json') as f:
-    backup = json.load(f)
+def safe_put_workflow(backup_path, current_api_json, api_token, host, workflow_id):
+    """
+    Usa el backup exportado desde UI (con credentials reales) como fuente de verdad
+    para las credenciales. Aplica los cambios del current_api_json (sin credentials)
+    sobre la estructura del backup.
+    """
+    with open(backup_path) as f:
+        backup = json.load(f)
 
-cred_map = {n['name']: n['credentials']
-            for n in backup['nodes'] if n.get('credentials')}
+    # Mapa nombre → credentials del backup (fuente de verdad)
+    cred_map = {n['name']: n['credentials']
+                for n in backup['nodes'] if n.get('credentials')}
 
-# 2. Load current workflow (credentials will be {})
-with open('current.json') as f:
-    current = json.load(f)
+    # Restaurar credentials en el JSON modificado
+    for node in current_api_json.get('nodes', []):
+        if node['name'] in cred_map:
+            node['credentials'] = cred_map[node['name']]
+        # Si credentials sigue siendo {} después, ese nodo no tenía credential en backup
+        # (normal para nodos sin autenticación)
 
-# 3. Restore credentials before PUT
-for node in current['nodes']:
-    if node['name'] in cred_map:
-        node['credentials'] = cred_map[node['name']]
-
-# 4. PUT with credentials restored
+    # PUT seguro
+    # ...
 ```
 
-Keep an exported backup in the repo. Re-export after any UI change that modifies credentials.
+### Flujo completo ante cada cambio al workflow
+
+```
+1. Exportar workflow desde n8n UI → guardar en Respaldos n8n/ con fecha
+2. Editar el JSON del backup (tiene credentials reales)
+3. Construir payload PUT: {name, nodes, connections, settings, staticData}
+4. PUT a la API
+5. Verificar HTTP 200
+6. Hacer una ejecución de prueba para confirmar que las credenciales siguen activas
+```
+
+**Señales de credenciales rotas post-PUT:**
+- Ejecuciones fallan en nodos httpRequest con error 401 o "credential not found"
+- `Postgres Chat Memory` no guarda filas en Supabase
+- `Get a document` no carga el prompt
 
 ## Supabase Direct Access
 
@@ -336,16 +442,77 @@ curl -s -X DELETE \
 | Parsing AI content before new row appears | Always `wait_for_new_row` before reading content |
 | Checking only `parte1` for pass/fail | Also check `cambiar_etapa_id`, `notificar_equipo`, and custom field values |
 | Forgetting to reset Kommo stage | Prompts may behave differently depending on current stage |
-| PUT workflow without restoring credentials | Load backup, restore `credentials` map before any PUT |
+| PUT workflow without restoring credentials | Load backup exportado desde UI, restaurar mapa de credentials antes de cada PUT |
+| Usar GET de la API como backup de credenciales | El GET devuelve `credentials:{}` — solo el export de la UI tiene los IDs reales |
+| Editar el workflow desde la UI sin exportar antes | Exportar siempre antes de cambiar cualquier cosa |
+| Poner header de versión en el Google Doc | El header `# v2.9` se inyecta en el system prompt y cambia el comportamiento del agente |
+| Sobreescribir el archivo de prompt activo | Crear siempre un archivo nuevo con número de versión mayor |
 | Sending next message before previous AI response | Wait for new Supabase row before each `send()` |
 
 ## Prompt Version Control
 
-- Keep prompt versions as local `.md` files (e.g., `prompt-v2.9.md`)
-- Prompt lives in a Google Doc fetched at runtime by the `Get a document` n8n node
-- Update the Google Doc manually after validating the new version passes the full battery
-- Do NOT include changelog headers in the Google Doc — they get injected into the system prompt
-- Changelog belongs only in the local `.md` file
+### Estructura de carpeta
+
+```
+n8n-<proyecto>/
+  PROMPT-n8n-<Nombre>/
+    prompt-v2.6.md    ← versión histórica
+    prompt-v2.7.md
+    prompt-v2.8.md
+    prompt-v2.9.md    ← versión activa en Google Doc
+```
+
+**Una archivo por versión, nunca sobreescribir.** Cada cambio — aunque sea de una línea — crea un archivo nuevo con número de versión mayor.
+
+### Formato del archivo de versión
+
+```markdown
+# v2.9
+
+> **Cambios vs v2.8:**
+> - PASO 7: link del mapa solo se envía una vez (Paso 6B)
+> - PASO 7: respuesta sin asientos → pide aclaración sin reenviar mapa (Intento 1)
+
+> **Cambios vs v2.7 (heredados):**
+> - Links de Google Maps en puntos de entrega
+
+[contenido real del prompt desde aquí...]
+```
+
+El header de versión y changelog van SOLO en el archivo local `.md`. **No copiar al Google Doc** — se inyectan en el system prompt del agente y afectan el comportamiento.
+
+### Flujo de cambio de prompt
+
+```
+1. Copiar el archivo activo → prompt-vX.Y+1.md
+2. Aplicar cambios en el nuevo archivo
+3. Actualizar el header de versión y changelog
+4. Correr la batería de tests completa contra el Google Doc ACTUAL (sin cambios)
+   → Confirmar que todos los tests previos siguen pasando (baseline)
+5. Actualizar el Google Doc con el contenido del nuevo archivo
+   (sin el header # vX.Y ni el bloque > Cambios vs...)
+6. Correr la batería de tests completa de nuevo
+   → Confirmar que los nuevos tests también pasan
+7. Solo si pasa todo: el nuevo archivo queda como versión activa
+```
+
+### Relación Google Doc ↔ archivo local
+
+| Google Doc | Archivo local `.md` |
+|------------|---------------------|
+| Solo el contenido del prompt (sin header ni changelog) | Todo: header, changelog + contenido |
+| Actualizado manualmente después de validar | Versionado en el repo |
+| Cargado en tiempo real por n8n en cada ejecución | Referencia histórica y punto de restauración |
+| Si se corrompe → restaurar desde el `.md` activo | Fuente de verdad |
+
+### Cuándo crear nueva versión
+
+| Cambio | Acción |
+|--------|--------|
+| Nuevo comportamiento (nueva regla, nuevo paso) | Versión mayor: v2.9 → v2.10 |
+| Fix de bug en regla existente | Versión menor: v2.9 → v2.9.1 |
+| Corrección tipográfica sin impacto en comportamiento | Opcional: puede ser el mismo archivo con nota |
+| Cambio que requiere nueva batería de tests | Siempre versión nueva |
 
 ## Full Battery Template
 
