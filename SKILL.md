@@ -544,3 +544,180 @@ for name, turns in BATTERY:
     ok, results = run_test(name, turns)
     print(f"{'✅' if ok else '❌'} {name}")
 ```
+
+---
+
+## Live Telegram Audit
+
+Optional feature: stream test progress to a Telegram chat (private or group) in real time. Sends 1 message per turn, 1 summary per test, and 1 summary per battery — exactly mirroring what the test runner is doing.
+
+### When to enable
+
+- New battery being run for first time → enable to watch real-time
+- User explicitly approves a passed test and wants to inform stakeholders
+- Regression battery before deploying a prompt change
+- Asks to enable **once per battery run** (not silent default)
+
+### Setup (one-time per project)
+
+1. **Create Telegram bot** via `@BotFather` → save `BOT_TOKEN`.
+2. **Get the chat_id**:
+   - Private: send any message to the bot → `https://api.telegram.org/bot<TOKEN>/getUpdates` → take `chat.id`
+   - Group: create group, add bot, send `/start@<bot_username>` → poll updates → take negative `chat.id`
+3. **Store in env**:
+   ```bash
+   TELEGRAM_BOT_TOKEN=<token>
+   TELEGRAM_AUDIT_CHAT_ID=<chat_id>
+   ```
+4. **Deploy n8n workflow** `cami-audit-telegram-push` (template: receives webhook → formats Markdown → posts to Telegram via Bot API).
+
+### Webhook contract — `cami-audit-push`
+
+Endpoint your test runner calls: `POST https://<n8n-host>/webhook/cami-audit-push`
+
+Three event types, distinguished by `kind`:
+
+#### `kind: "turn"` — fired after each user↔AI exchange
+```json
+{
+  "kind": "turn",
+  "battery_label": "v3.10 post-fix-concatena",
+  "test_id": "T01",
+  "turn_idx": 4,
+  "turn_total": 5,
+  "lead_name": "Fran de emprendeespina",
+  "lead_url": "https://camialegre.kommo.com/leads/detail/39283259",
+  "user_message": "fui a nutris pero me dan dietas genericas",
+  "ai_response": "Te entiendo, Fran...",
+  "latency_ms": 2100,
+  "asserts": [
+    {"name": "response_pregunta_count == 1", "passed": true},
+    {"name": "no_concatena_dos_preguntas", "passed": true, "expected": "...", "actual": "..."}
+  ],
+  "crm_diff": {
+    "stage": {"from": {"name": "LEAD NUEVO"}, "to": {"name": "iA Agente iG, Tik, Fb"}},
+    "tags_added": ["objecion_nutricionistas"],
+    "tags_removed": [],
+    "fields_changed": [
+      {"field": "objetivo", "from": "", "to": "personalizar plan"}
+    ],
+    "notes_added": [{"text": "Cliente rebota de nutris convencionales"}],
+    "tasks_added": [{"text": "Seguimiento mañana", "complete_till": "2026-05-19T13:00:00Z"}]
+  }
+}
+```
+
+#### `kind: "test_summary"` — fired at end of each test
+```json
+{
+  "kind": "test_summary",
+  "battery_label": "v3.10 post-fix-concatena",
+  "test_id": "T01",
+  "description": "P4 no concatena dos preguntas",
+  "passed_count": 5,
+  "total_count": 5,
+  "turns": [
+    {"turn_idx": 1, "latency_ms": 1800, "asserts": [{"passed": true}, {"passed": true}]}
+  ],
+  "notes": "FIX VALIDADO"
+}
+```
+
+#### `kind: "battery_summary"` — fired at end of battery
+```json
+{
+  "kind": "battery_summary",
+  "battery_label": "v3.10 post-fix-concatena",
+  "tests_count": 4,
+  "passed_asserts": 18,
+  "total_asserts": 18,
+  "duration_s": 47,
+  "report_path": "tests/reports/2026-05-18_v3.10_post-fix-concatena.md",
+  "tests": [
+    {"test_id": "T01", "passed_count": 5, "total_count": 5}
+  ]
+}
+```
+
+### Trigger flow (per battery)
+
+Before running the battery, **always ask the user**:
+1. **chat_id** target (suggest last used, allow override)
+2. **mode** (full report — default — or executive summary)
+3. **label** of the battery (free text, ej. "v3.10 post-fix-concatena")
+
+Then:
+1. POST `{kind: "battery_start", ...}` → bot announces start in chat.
+2. For each test, for each turn: POST `{kind: "turn", ...}`.
+3. At end of test: POST `{kind: "test_summary", ...}`.
+4. At end of battery: POST `{kind: "battery_summary", ...}` with `report_path` pointing to the generated `.md`.
+
+### Folder convention
+
+Reports persist in `<project>/tests/`:
+
+```
+<project>/tests/
+├── batteries/                                      # YAML definitions
+│   └── v3.10_post-fix-concatena.yaml
+├── reports/                                        # one .md per battery run
+│   ├── 2026-05-18_14-23_v3.10_post-fix-concatena.md   # human-readable
+│   └── 2026-05-18_14-23_v3.10_post-fix-concatena.json # raw data
+└── archive/                                        # compressed old reports
+```
+
+The `.md` report mirrors what was sent to Telegram, in long form (no message size limit), plus prompt diff, environment snapshot, and notes added by the user manually post-run.
+
+### Battery YAML format
+
+```yaml
+battery_label: v3.10 post-fix-concatena
+prompt_version: "3.10"
+lead_id: 39283259
+chat_id_target: -5244213309   # Telegram group
+tests:
+  - test_id: T01
+    description: "P4 no concatena dos preguntas"
+    turns:
+      - user: "Holaa"
+        asserts:
+          - name: response_pregunta_count == 1
+            kind: pregunta_count
+            expected: 1
+      - user: "peso 78, quiero 65"
+        asserts:
+          - name: response_pregunta_count == 1
+            kind: pregunta_count
+            expected: 1
+          - name: tag_added contains "calificando"
+            kind: tag_present
+            expected: "calificando"
+      - user: "fui a nutris, dietas genéricas, las dejo"
+        asserts:
+          - name: response_pregunta_count == 1
+            kind: pregunta_count
+            expected: 1
+          - name: no_concatena_dos_preguntas
+            kind: response_not_contains
+            expected: "y te funcionó? no? porque"
+```
+
+### Built-in assertion kinds
+
+| Kind | Description |
+|------|-------------|
+| `pregunta_count` | `expected` is N; count of `?` in AI response must equal N |
+| `response_contains` | response must include the substring |
+| `response_not_contains` | response must NOT include the substring |
+| `tag_present` | lead must have this tag after the turn |
+| `tag_absent` | lead must NOT have this tag |
+| `stage_id` | lead status_id must equal expected |
+| `field_value` | `field` key + `expected` value; checks current value |
+| `note_added` | a note with this substring was created in this turn |
+| `task_added` | a task with this substring was created |
+| `latency_under_ms` | turn must complete under N ms |
+
+### Security note
+
+Never commit `BOT_TOKEN` to the repo. Always read from `~/.claude/secrets/<project>.env`. If a token appears in git history, immediately revoke via `@BotFather` → Bot Settings → API Token → Revoke.
+
