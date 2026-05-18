@@ -1,6 +1,6 @@
 ---
 name: kommo-n8n-prompt-testing
-description: Use when testing an n8n AI agent that receives Kommo CRM webhooks and responds via salesbot. Covers multi-turn conversation testing, Supabase memory polling, webhook payload construction, reset protocol, and response validation. Use when debugging agent behavior, validating prompt changes, or running a regression battery before deploying a new prompt version.
+description: Use when testing an n8n AI agent that receives Kommo CRM webhooks and responds via salesbot, or when running a regression battery against a Kommo+ManyChat AI sales agent. Covers multi-turn conversation testing, Supabase memory polling, webhook payload construction, reset protocol, response validation, and optional live audit streaming to Telegram. Activate for phrases like "correr batería", "probar prompt vN", "regression test Cami", "audit live Telegram", "validar fix", "live audit", "test runner Kommo".
 ---
 
 # Kommo + n8n Prompt Testing
